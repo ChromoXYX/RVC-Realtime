@@ -141,6 +141,14 @@ class RVCPerformanceStats:
     total_e2e_ms: float = 0.0
     max_e2e_ms: float = 0.0
     last_e2e_ms: float = 0.0
+    # VAD 
+    vad_chunks_total: int = 0
+    vad_chunks_speech: int = 0
+    vad_chunks_silence: int = 0
+    vad_prob_sum: float = 0.0
+    vad_prob_last: float | None = None
+    vad_prob_min: float = 1.0
+    vad_prob_max: float = 0.0
 
     def record(self, infer_time_ms: float | None, e2e_ms: float | None):
         if infer_time_ms is not None:
@@ -156,8 +164,20 @@ class RVCPerformanceStats:
             self.last_e2e_ms = e2e_value
             self.max_e2e_ms = max(self.max_e2e_ms, e2e_value)
 
+    def record_vad(self, vad_prob: float, is_silence: bool):
+        """记录一个 chunk 的 VAD 指标（infer_time_ms=0 时为 silence chunk）。"""
+        self.vad_chunks_total += 1
+        self.vad_prob_sum += vad_prob
+        self.vad_prob_last = vad_prob
+        self.vad_prob_min = min(self.vad_prob_min, vad_prob)
+        self.vad_prob_max = max(self.vad_prob_max, vad_prob)
+        if is_silence:
+            self.vad_chunks_silence += 1
+        else:
+            self.vad_chunks_speech += 1
+
     def to_summary(self):
-        return {
+        summary = {
             "infer_count": self.infer_count,
             "infer_avg_ms": (
                 round(self.total_infer_ms / self.infer_count, 3)
@@ -173,6 +193,18 @@ class RVCPerformanceStats:
             "e2e_max_ms": round(self.max_e2e_ms, 3) if self.e2e_count else None,
             "e2e_last_ms": round(self.last_e2e_ms, 3) if self.e2e_count else None,
         }
+        if self.vad_chunks_total > 0:
+            summary["vad"] = {
+                "total_chunks": self.vad_chunks_total,
+                "speech_chunks": self.vad_chunks_speech,
+                "silence_chunks": self.vad_chunks_silence,
+                "silence_ratio": round(self.vad_chunks_silence / self.vad_chunks_total, 4),
+                "prob_avg": round(self.vad_prob_sum / self.vad_chunks_total, 4),
+                "prob_min": round(self.vad_prob_min, 4),
+                "prob_max": round(self.vad_prob_max, 4),
+                "prob_last": round(self.vad_prob_last, 4) if self.vad_prob_last is not None else None,
+            }
+        return summary
 
 
 class RVCPerformanceLogger:
@@ -226,18 +258,32 @@ class RVCPerformanceLogger:
                 self.pending_chunks.pop(key, None)
 
         self.stats.record(infer_time_ms, e2e_ms)
+
+        vad_prob_raw = payload.get("vad_prob")
+        vad_prob: float | None = None
+        if vad_prob_raw is not None:
+            try:
+                vad_prob = float(vad_prob_raw)
+            except (TypeError, ValueError):
+                vad_prob = None
+        if vad_prob is not None:
+            is_silence = (infer_time_ms is not None and infer_time_ms == 0.0)
+            self.stats.record_vad(vad_prob, is_silence)
+
         sample_count = payload.get("sample_count", "?")
         infer_display = f"{infer_time_ms:.2f}" if infer_time_ms is not None else "?"
         e2e_display = f"{e2e_ms:.2f}" if e2e_ms is not None else "?"
         sent_display = sent_sample_count if sent_sample_count is not None else "?"
+        vad_display = f" vad_prob={vad_prob:.3f}" if vad_prob is not None else ""
         print(
-            f"[{time.strftime('%H:%M:%S')}] rvc-meta seq={sequence_id} infer_ms={infer_display} e2e_ms={e2e_display} sample_count={sample_count} sent_samples={sent_display}",
+            f"[{time.strftime('%H:%M:%S')}] rvc-meta seq={sequence_id} infer_ms={infer_display} e2e_ms={e2e_display} sample_count={sample_count} sent_samples={sent_display}{vad_display}",
             flush=True,
         )
         return {
             "sequence_id": sequence_id,
             "infer_time_ms": infer_time_ms,
             "e2e_ms": e2e_ms,
+            "vad_prob": vad_prob,
         }
 
     def get_summary(self):
@@ -355,6 +401,7 @@ def build_start_payload(args):
         "output_ttl_ms": args.output_ttl_ms,
         "reconnect_ttl_ms": args.reconnect_ttl_ms,
         "use_phase_vocoder": args.use_phase_vocoder,
+        "enable_vad": args.silero_vad
     }
 
 
@@ -1159,6 +1206,11 @@ def main():
         "--auto-start-for-rtt",
         action="store_true",
         help="rtt 模式下自动 start/stop 一个实时 session，以便测试 WS RTT",
+    )
+    parser.add_argument(
+        "--silero-vad",
+        action="store_true",
+        help="启用Silero VAD"
     )
     args = parser.parse_args()
 

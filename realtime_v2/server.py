@@ -11,6 +11,8 @@ from enum import Enum
 from typing import Optional
 
 import numpy as np
+import torch
+import librosa
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 import uvicorn
@@ -23,6 +25,56 @@ if PROJECT_ROOT not in sys.path:
 from configs.config import Config
 from realtime_v2.engine import RealtimeRVCConfig, RealtimeRVCEngine
 from realtime_v2.model_adapter import RVCModelConfig, RVCRealtimeAdapter
+
+
+class SileroVAD:
+    def __init__(self, threshold: float = 0.5, device: str = "cpu"):
+        self.threshold = threshold
+        self.device = torch.device(device)
+        self._model = None
+        self._get_speech_timestamps = None
+
+    def _ensure_loaded(self):
+        if self._model is not None:
+            return
+        model, utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            onnx=False,
+        )
+        self._model = model.to(self.device)
+        # utils: (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks)
+        self._get_speech_timestamps = utils[0]
+
+    def reset(self):
+        if self._model is not None:
+            self._model.reset_states()
+
+    def warmup(self):
+        self._ensure_loaded()
+        dummy = np.zeros(self._FRAME_SIZE, dtype=np.float32)
+        self.is_speech(dummy)
+        self.reset()
+
+    _FRAME_SIZE = 512
+
+    def is_speech(self, samples_16k: np.ndarray) -> tuple[bool, float]:
+        self._ensure_loaded()
+        audio = samples_16k.astype(np.float32)
+        remainder = len(audio) % self._FRAME_SIZE
+        if remainder != 0:
+            audio = np.pad(audio, (0, self._FRAME_SIZE - remainder))
+        max_prob = 0.0
+        with torch.no_grad():
+            for i in range(0, len(audio), self._FRAME_SIZE):
+                frame = torch.from_numpy(audio[i : i + self._FRAME_SIZE]).to(
+                    self.device
+                )
+                p = float(self._model(frame, 16000).item())
+                if p > max_prob:
+                    max_prob = p
+        return max_prob >= self.threshold, max_prob
 
 
 class SessionStatus(str, Enum):
@@ -52,6 +104,8 @@ class StartRequest(BaseModel):
     input_ttl_ms: float = 500.0
     output_ttl_ms: float = 500.0
     reconnect_ttl_ms: float = 30000.0
+    enable_vad: bool = False
+    vad_threshold: float = 0.5
 
 
 class RttProbeRequest(BaseModel):
@@ -76,6 +130,7 @@ class OutputSlot:
     created_at: float = 0.0
     expire_at: float = 0.0
     infer_time_ms: float = 0.0
+    vad_prob: float | None = None
 
 
 @dataclass
@@ -117,6 +172,7 @@ class RealtimeSession:
         self.input_ttl_ms = 500.0
         self.output_ttl_ms = 500.0
         self.reconnect_ttl_ms = 30000.0
+        self.vad: Optional[SileroVAD] = None
 
     async def start(self, req: StartRequest):
         async with self.session_lock:
@@ -150,6 +206,14 @@ class RealtimeSession:
                 input_sr=input_sr,
             )
             self.engine.initialize_stream()
+            if req.enable_vad:
+                device_str = (
+                    str(self.adapter.device) if self.adapter is not None else "cpu"
+                )
+                self.vad = SileroVAD(threshold=req.vad_threshold, device=device_str)
+                await asyncio.to_thread(self.vad.warmup)
+            else:
+                self.vad = None
             self.input_queue = asyncio.Queue(maxsize=max(1, req.input_queue_size))
             self.output_slot = OutputSlot()
             self.output_event = asyncio.Event()
@@ -183,12 +247,19 @@ class RealtimeSession:
             except asyncio.CancelledError:
                 pass
             self.infer_task = None
-        self.status = SessionStatus.STOPPED if self.engine is not None or self.adapter is not None else SessionStatus.IDLE
+        self.status = (
+            SessionStatus.STOPPED
+            if self.engine is not None or self.adapter is not None
+            else SessionStatus.IDLE
+        )
         self.transport_status = TransportStatus.DETACHED
         self.active_websocket = None
         self.input_queue = None
         self.engine = None
         self.adapter = None
+        if self.vad is not None:
+            self.vad.reset()
+            self.vad = None
         self.output_event = asyncio.Event()
         self.output_slot = OutputSlot()
 
@@ -198,7 +269,9 @@ class RealtimeSession:
                 await websocket.close(code=1013, reason="session not running")
                 return False
             if self.active_websocket is not None:
-                await self.active_websocket.close(code=1012, reason="replaced by new connection")
+                await self.active_websocket.close(
+                    code=1012, reason="replaced by new connection"
+                )
             self.active_websocket = websocket
             self.transport_status = TransportStatus.ATTACHED
             self.last_attach_at = time.monotonic()
@@ -211,7 +284,9 @@ class RealtimeSession:
             self.active_websocket = None
             self.transport_status = TransportStatus.DETACHED
             self.last_detach_at = time.monotonic()
-            self.reconnect_deadline = self.last_detach_at + self.reconnect_ttl_ms / 1000.0
+            self.reconnect_deadline = (
+                self.last_detach_at + self.reconnect_ttl_ms / 1000.0
+            )
 
     async def submit_input(self, samples: np.ndarray):
         if self.status not in (SessionStatus.RUNNING, SessionStatus.FLUSHING):
@@ -247,7 +322,13 @@ class RealtimeSession:
             self.flush_requested = True
             self.status = SessionStatus.FLUSHING
 
-    async def _publish_output(self, sequence_id: int, wave: np.ndarray, infer_time_ms: float):
+    async def _publish_output(
+        self,
+        sequence_id: int,
+        wave: np.ndarray,
+        infer_time_ms: float,
+        vad_prob: float | None = None,
+    ):
         now = time.monotonic()
         expire_at = now + self.output_ttl_ms / 1000.0
         payload = wave.astype(np.float32, copy=False).tobytes()
@@ -264,6 +345,7 @@ class RealtimeSession:
                 created_at=now,
                 expire_at=expire_at,
                 infer_time_ms=infer_time_ms,
+                vad_prob=vad_prob,
             )
             self.stats.produced_output_chunks += 1
             self.stats.last_output_sequence_id = sequence_id
@@ -274,14 +356,19 @@ class RealtimeSession:
         try:
             while not self.stop_requested:
                 now = time.monotonic()
-                if self.transport_status == TransportStatus.DETACHED and now > self.reconnect_deadline:
+                if (
+                    self.transport_status == TransportStatus.DETACHED
+                    and now > self.reconnect_deadline
+                ):
                     self.status = SessionStatus.STOPPED
                     break
 
                 chunk: InputChunk | None = None
                 if self.input_queue is not None:
                     try:
-                        chunk = await asyncio.wait_for(self.input_queue.get(), timeout=0.1)
+                        chunk = await asyncio.wait_for(
+                            self.input_queue.get(), timeout=0.1
+                        )
                     except asyncio.TimeoutError:
                         chunk = None
 
@@ -291,8 +378,15 @@ class RealtimeSession:
                         self.flush_requested = False
                         while remaining > 0 and not self.stop_requested:
                             current = min(self.engine.block_frame, remaining)
-                            result = await asyncio.to_thread(self.engine.process_block, np.zeros(current, dtype=np.float32))
-                            await self._publish_output(result.block_index, result.output_wave[:current], result.infer_time_ms)
+                            result = await asyncio.to_thread(
+                                self.engine.process_block,
+                                np.zeros(current, dtype=np.float32),
+                            )
+                            await self._publish_output(
+                                result.block_index,
+                                result.output_wave[:current],
+                                result.infer_time_ms,
+                            )
                             remaining -= current
                         self.status = SessionStatus.RUNNING
                     continue
@@ -309,8 +403,46 @@ class RealtimeSession:
 
                 if self.engine is None:
                     continue
-                result = await asyncio.to_thread(self.engine.process_block, chunk.samples)
-                await self._publish_output(chunk.sequence_id, result.output_wave[: chunk.samples.shape[0]], result.infer_time_ms)
+
+                # --- Silero VAD ---
+                vad_prob: float | None = None
+                if self.vad is not None:
+                    samples_16k = librosa.resample(
+                        chunk.samples,
+                        orig_sr=self.engine.input_sr,
+                        target_sr=16000,
+                    )
+                    is_speech, vad_prob = await asyncio.to_thread(
+                        self.vad.is_speech, samples_16k
+                    )
+                    if not is_speech:
+                        silence_input = np.zeros(
+                            chunk.samples.shape[0], dtype=np.float32
+                        )
+                        result = await asyncio.to_thread(
+                            self.engine.process_block, silence_input
+                        )
+                        silence_output = np.zeros(
+                            chunk.samples.shape[0], dtype=np.float32
+                        )
+                        await self._publish_output(
+                            chunk.sequence_id,
+                            silence_output,
+                            result.infer_time_ms,
+                            vad_prob=vad_prob,
+                        )
+                        continue
+                # ----------------------
+
+                result = await asyncio.to_thread(
+                    self.engine.process_block, chunk.samples
+                )
+                await self._publish_output(
+                    chunk.sequence_id,
+                    result.output_wave[: chunk.samples.shape[0]],
+                    result.infer_time_ms,
+                    vad_prob=vad_prob,
+                )
         except asyncio.CancelledError:
             raise
         finally:
@@ -404,6 +536,8 @@ async def _send_loop(websocket: WebSocket):
                 "infer_time_ms": slot.infer_time_ms,
                 "version": slot.version,
             }
+        if slot.vad_prob is not None:
+            meta["vad_prob"] = slot.vad_prob
         await websocket.send_text(json.dumps(meta))
         await websocket.send_bytes(payload)
         last_sent_version = version
@@ -426,7 +560,9 @@ async def _recv_loop(websocket: WebSocket):
                     await session.stop()
                     return
                 elif msg_type == "ping":
-                    await websocket.send_text(json.dumps({"type": "pong", "ts": time.time()}))
+                    await websocket.send_text(
+                        json.dumps({"type": "pong", "ts": time.time()})
+                    )
                 elif msg_type == "rtt_probe":
                     await websocket.send_text(
                         json.dumps(
@@ -456,7 +592,9 @@ async def realtime_ws(websocket: WebSocket):
         await websocket.send_text(json.dumps({"type": "attached"}))
         recv_task = asyncio.create_task(_recv_loop(websocket), name="recv-realtime")
         send_task = asyncio.create_task(_send_loop(websocket), name="send-realtime")
-        done, pending = await asyncio.wait({recv_task, send_task}, return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait(
+            {recv_task, send_task}, return_when=asyncio.FIRST_COMPLETED
+        )
         for task in pending:
             task.cancel()
         for task in pending:
@@ -478,7 +616,9 @@ async def realtime_ws(websocket: WebSocket):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FastAPI realtime server for realtime_v2 RVC")
+    parser = argparse.ArgumentParser(
+        description="FastAPI realtime server for realtime_v2 RVC"
+    )
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=6243)
     args = parser.parse_args()
