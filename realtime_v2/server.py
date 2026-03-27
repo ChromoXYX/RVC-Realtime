@@ -4,17 +4,15 @@ import argparse
 import asyncio
 import json
 import os
-from collections.abc import Callable
 import sys
 import time
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Optional
 
 import numpy as np
-import torch
 import librosa
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 import uvicorn
 
@@ -26,56 +24,7 @@ if PROJECT_ROOT not in sys.path:
 from configs.config import Config
 from realtime_v2.engine import RealtimeRVCConfig, RealtimeRVCEngine
 from realtime_v2.model_adapter import RVCModelConfig, RVCRealtimeAdapter
-
-
-class SileroVAD:
-    def __init__(self, threshold: float = 0.5, device: str = "cpu"):
-        self.threshold = threshold
-        self.device = torch.device(device)
-        self._model = None
-        self._get_speech_timestamps = None
-
-    def _ensure_loaded(self):
-        if self._model is not None:
-            return
-        model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=False,
-            onnx=False,
-        )
-        self._model = model.to(self.device)
-        # utils: (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks)
-        self._get_speech_timestamps = utils[0]
-
-    def reset(self):
-        if self._model is not None:
-            self._model.reset_states()
-
-    def warmup(self):
-        self._ensure_loaded()
-        dummy = np.zeros(self._FRAME_SIZE, dtype=np.float32)
-        self.is_speech(dummy)
-        self.reset()
-
-    _FRAME_SIZE = 512
-
-    def is_speech(self, samples_16k: np.ndarray) -> tuple[bool, float]:
-        self._ensure_loaded()
-        audio = samples_16k.astype(np.float32)
-        remainder = len(audio) % self._FRAME_SIZE
-        if remainder != 0:
-            audio = np.pad(audio, (0, self._FRAME_SIZE - remainder))
-        max_prob = 0.0
-        with torch.no_grad():
-            for i in range(0, len(audio), self._FRAME_SIZE):
-                frame = torch.from_numpy(audio[i : i + self._FRAME_SIZE]).to(
-                    self.device
-                )
-                p = float(self._model(frame, 16000).item())
-                if p > max_prob:
-                    max_prob = p
-        return max_prob >= self.threshold, max_prob
+from realtime_v2.runtime import AnalysisContext, ExecutionContext, InputChunk, RuntimePipeline, build_runtime
 
 
 class SessionStatus(str, Enum):
@@ -115,36 +64,6 @@ class RttProbeRequest(BaseModel):
 
 
 @dataclass
-class InputChunk:
-    sequence_id: int
-    input_sr: int
-    master_samples: np.ndarray
-    sample_views: dict[int, np.ndarray]
-    features: dict[str, Any]
-    created_at: float
-    expire_at: float
-
-    def get_view(
-        self,
-        sr: int,
-        *,
-        resampler: Callable[[np.ndarray, int, int], np.ndarray],
-    ) -> np.ndarray:
-        if sr not in self.sample_views:
-            if sr == self.input_sr:
-                self.sample_views[sr] = self.master_samples
-            else:
-                self.sample_views[sr] = resampler(self.master_samples, self.input_sr, sr)
-        return self.sample_views[sr]
-
-    def set_feature(self, name: str, value: Any):
-        self.features[name] = value
-
-    def get_feature(self, name: str, default: Any = None):
-        return self.features.get(name, default)
-
-
-@dataclass
 class OutputSlot:
     version: int = 0
     sequence_id: int = -1
@@ -168,89 +87,6 @@ class SessionStats:
     last_output_sequence_id: int = -1
     congested: bool = False
     congestion_since: float | None = None
-
-
-@dataclass
-class AnalysisContext:
-    resampler: Callable[[np.ndarray, int, int], np.ndarray]
-
-
-@dataclass
-class ExecutionContext:
-    engine: RealtimeRVCEngine
-    resampler: Callable[[np.ndarray, int, int], np.ndarray]
-
-
-@dataclass
-class GateDecision:
-    action: str
-    engine_input: np.ndarray
-    block_16k: np.ndarray | None
-    output_override: np.ndarray | None = None
-
-
-class FrameAnalyzer:
-    async def analyze(self, chunk: InputChunk, context: AnalysisContext):
-        raise NotImplementedError
-
-
-class FramePolicy:
-    def decide(self, chunk: InputChunk, context: ExecutionContext) -> GateDecision:
-        raise NotImplementedError
-
-
-class FrameExecutor:
-    async def execute(self, chunk: InputChunk, decision: GateDecision, context: ExecutionContext):
-        result = await asyncio.to_thread(
-            context.engine.process_block,
-            decision.engine_input,
-            silence_16k=decision.block_16k,
-        )
-        output_wave = decision.output_override
-        if output_wave is None:
-            output_wave = result.output_wave[: chunk.master_samples.shape[0]]
-        return output_wave, result.infer_time_ms
-
-
-class SileroVADAnalyzer(FrameAnalyzer):
-    def __init__(self, vad: SileroVAD):
-        self.vad = vad
-
-    async def analyze(self, chunk: InputChunk, context: AnalysisContext):
-        chunk_16k = chunk.get_view(16000, resampler=context.resampler)
-        is_speech, vad_prob = await asyncio.to_thread(self.vad.is_speech, chunk_16k)
-        chunk.set_feature("analysis_view_16k", chunk_16k)
-        chunk.set_feature("is_speech", is_speech)
-        chunk.set_feature("vad_prob", vad_prob)
-
-
-class PassthroughPolicy(FramePolicy):
-    def decide(self, chunk: InputChunk, context: ExecutionContext) -> GateDecision:
-        block_16k = chunk.get_feature("analysis_view_16k")
-        return GateDecision(
-            action="run_rvc",
-            engine_input=chunk.master_samples,
-            block_16k=block_16k,
-        )
-
-
-class SpeechGatePolicy(FramePolicy):
-    def decide(self, chunk: InputChunk, context: ExecutionContext) -> GateDecision:
-        block_16k = chunk.get_feature("analysis_view_16k")
-        if chunk.get_feature("is_speech") is False:
-            silence_input = np.zeros(chunk.master_samples.shape[0], dtype=np.float32)
-            silence_output = np.zeros(chunk.master_samples.shape[0], dtype=np.float32)
-            return GateDecision(
-                action="push_silence",
-                engine_input=silence_input,
-                block_16k=block_16k,
-                output_override=silence_output,
-            )
-        return GateDecision(
-            action="run_rvc",
-            engine_input=chunk.master_samples,
-            block_16k=block_16k,
-        )
 
 
 class RealtimeSession:
@@ -278,10 +114,7 @@ class RealtimeSession:
         self.input_ttl_ms = 500.0
         self.output_ttl_ms = 500.0
         self.reconnect_ttl_ms = 30000.0
-        self.vad: Optional[SileroVAD] = None
-        self.analyzers: list[FrameAnalyzer] = []
-        self.policy: FramePolicy = PassthroughPolicy()
-        self.executor = FrameExecutor()
+        self.runtime: RuntimePipeline | None = None
 
     @staticmethod
     def _resample(samples: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
@@ -325,18 +158,7 @@ class RealtimeSession:
                 input_sr=input_sr,
             )
             self.engine.initialize_stream()
-            if req.enable_vad:
-                device_str = (
-                    str(self.adapter.device) if self.adapter is not None else "cpu"
-                )
-                self.vad = SileroVAD(threshold=req.vad_threshold, device=device_str)
-                await asyncio.to_thread(self.vad.warmup)
-                self.analyzers = [SileroVADAnalyzer(self.vad)]
-                self.policy = SpeechGatePolicy()
-            else:
-                self.vad = None
-                self.analyzers = []
-                self.policy = PassthroughPolicy()
+            self.runtime = await build_runtime(req, self.adapter)
             self.input_queue = asyncio.Queue(maxsize=max(1, req.input_queue_size))
             self.output_slot = OutputSlot()
             self.output_event = asyncio.Event()
@@ -380,11 +202,9 @@ class RealtimeSession:
         self.input_queue = None
         self.engine = None
         self.adapter = None
-        if self.vad is not None:
-            self.vad.reset()
-            self.vad = None
-        self.analyzers = []
-        self.policy = PassthroughPolicy()
+        if self.runtime is not None and self.runtime.vad is not None:
+            self.runtime.vad.reset()
+        self.runtime = None
         self.output_event = asyncio.Event()
         self.output_slot = OutputSlot()
 
@@ -534,16 +354,19 @@ class RealtimeSession:
                 if self.engine is None:
                     continue
 
+                if self.runtime is None:
+                    continue
+
                 analysis_context = AnalysisContext(resampler=self._resample)
-                for analyzer in self.analyzers:
+                for analyzer in self.runtime.analyzers:
                     await analyzer.analyze(chunk, analysis_context)
 
                 execution_context = ExecutionContext(
                     engine=self.engine,
                     resampler=self._resample,
                 )
-                decision = self.policy.decide(chunk, execution_context)
-                output_wave, infer_time_ms = await self.executor.execute(
+                decision = self.runtime.policy.decide(chunk, execution_context)
+                output_wave, infer_time_ms = await self.runtime.executor.execute(
                     chunk,
                     decision,
                     execution_context,
