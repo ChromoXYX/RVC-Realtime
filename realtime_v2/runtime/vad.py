@@ -60,7 +60,8 @@ class SileroVADAnalyzer(FrameAnalyzer):
         self.vad = vad
 
     async def analyze(self, chunk: InputChunk, context: AnalysisContext):
-        chunk_16k = chunk.get_view(16000, resampler=context.resampler)
+        stream_name = "clean" if chunk.has_stream("clean") else "input"
+        chunk_16k = chunk.get_stream_view(stream_name, 16000, resampler=context.resampler)
         is_speech, vad_prob = await asyncio.to_thread(self.vad.is_speech, chunk_16k)
         chunk.set_feature("analysis_view_16k", chunk_16k)
         chunk.set_feature("is_speech", is_speech)
@@ -70,17 +71,19 @@ class SileroVADAnalyzer(FrameAnalyzer):
 class SpeechGatePolicy(FramePolicy):
     def decide(self, chunk: InputChunk, context: ExecutionContext) -> GateDecision:
         block_16k = chunk.get_feature("analysis_view_16k")
+        stream_name = "clean" if chunk.has_stream("clean") else "input"
+        engine_input = chunk.get_stream_base_samples(stream_name)
         if chunk.get_feature("is_speech") is False:
-            silence_input = np.zeros(chunk.master_samples.shape[0], dtype=np.float32)
-            silence_output = np.zeros(chunk.master_samples.shape[0], dtype=np.float32)
+            silence_input = np.zeros(engine_input.shape[0], dtype=np.float32)
+            silence_output = np.zeros(engine_input.shape[0], dtype=np.float32)
             return GateDecision(
                 action="push_silence",
-                engine_input=silence_input,
+                engine_input_stream="__silence__",
                 block_16k=block_16k,
                 output_override=silence_output,
             )
         return GateDecision(
             action="run_rvc",
-            engine_input=chunk.master_samples,
+            engine_input_stream=stream_name,
             block_16k=block_16k,
         )

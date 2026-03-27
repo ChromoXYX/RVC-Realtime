@@ -271,13 +271,34 @@ class RVCPerformanceLogger:
             is_silence = (infer_time_ms is not None and infer_time_ms == 0.0)
             self.stats.record_vad(vad_prob, is_silence)
 
+        dfn_payload = payload.get("dfn")
+        dfn_display = ""
+        if isinstance(dfn_payload, dict) and dfn_payload.get("enabled"):
+            input_rms = dfn_payload.get("input_rms")
+            output_rms = dfn_payload.get("output_rms")
+            residual_rms = dfn_payload.get("residual_rms")
+            rms_ratio = dfn_payload.get("rms_ratio")
+            if all(
+                isinstance(v, (int, float))
+                for v in (input_rms, output_rms, residual_rms)
+            ):
+                ratio_text = f"{rms_ratio:.4f}" if isinstance(rms_ratio, (int, float)) else "?"
+                dfn_display = (
+                    f" dfn_in={input_rms:.4f}"
+                    f" dfn_out={output_rms:.4f}"
+                    f" dfn_res={residual_rms:.4f}"
+                    f" dfn_ratio={ratio_text}"
+                )
+            else:
+                dfn_display = f" dfn={json.dumps(dfn_payload, ensure_ascii=False)}"
+
         sample_count = payload.get("sample_count", "?")
         infer_display = f"{infer_time_ms:.2f}" if infer_time_ms is not None else "?"
         e2e_display = f"{e2e_ms:.2f}" if e2e_ms is not None else "?"
         sent_display = sent_sample_count if sent_sample_count is not None else "?"
         vad_display = f" vad_prob={vad_prob:.3f}" if vad_prob is not None else ""
         print(
-            f"[{datetime.now().strftime("%H:%M:%S.%f")[:-3]}] rvc-meta seq={sequence_id} infer_ms={infer_display} e2e_ms={e2e_display} sample_count={sample_count} sent_samples={sent_display}{vad_display}",
+            f"[{datetime.now().strftime("%H:%M:%S.%f")[:-3]}] rvc-meta seq={sequence_id} infer_ms={infer_display} e2e_ms={e2e_display} sample_count={sample_count} sent_samples={sent_display}{vad_display}{dfn_display}",
             flush=True,
         )
         return {
@@ -285,6 +306,7 @@ class RVCPerformanceLogger:
             "infer_time_ms": infer_time_ms,
             "e2e_ms": e2e_ms,
             "vad_prob": vad_prob,
+            "dfn": dfn_payload,
         }
 
     def get_summary(self):
@@ -402,7 +424,13 @@ def build_start_payload(args):
         "output_ttl_ms": args.output_ttl_ms,
         "reconnect_ttl_ms": args.reconnect_ttl_ms,
         "use_phase_vocoder": args.use_phase_vocoder,
-        "enable_vad": args.silero_vad
+        "enable_vad": args.silero_vad,
+        "vad_threshold": args.vad_threshold,
+        "enable_dfn": args.enable_dfn,
+        "dfn_backend": args.dfn_backend,
+        "dfn_atten_lim": args.dfn_atten_lim,
+        "dfn_post_filter_beta": args.dfn_post_filter_beta,
+        "dfn_compensate_delay": args.dfn_compensate_delay,
     }
 
 
@@ -1213,6 +1241,12 @@ def main():
         action="store_true",
         help="启用Silero VAD"
     )
+    parser.add_argument("--vad-threshold", type=float, default=0.5)
+    parser.add_argument("--enable-dfn", action="store_true")
+    parser.add_argument("--dfn-backend", type=str, default="native", choices=["native", "onnx"])
+    parser.add_argument("--dfn-atten-lim", type=float, default=None)
+    parser.add_argument("--dfn-post-filter-beta", type=float, default=0.0)
+    parser.add_argument("--dfn-compensate-delay", action="store_true")
     args = parser.parse_args()
 
     if args.stream_latency not in ("low", "high"):

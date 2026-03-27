@@ -56,6 +56,11 @@ class StartRequest(BaseModel):
     reconnect_ttl_ms: float = 30000.0
     enable_vad: bool = False
     vad_threshold: float = 0.5
+    enable_dfn: bool = False
+    dfn_backend: str = "native"
+    dfn_atten_lim: float | None = None
+    dfn_post_filter_beta: float = 0.0
+    dfn_compensate_delay: bool = False
 
 
 class RttProbeRequest(BaseModel):
@@ -73,6 +78,7 @@ class OutputSlot:
     expire_at: float = 0.0
     infer_time_ms: float = 0.0
     vad_prob: float | None = None
+    dfn_metrics: dict | None = None
 
 
 @dataclass
@@ -115,6 +121,7 @@ class RealtimeSession:
         self.output_ttl_ms = 500.0
         self.reconnect_ttl_ms = 30000.0
         self.runtime: RuntimePipeline | None = None
+        self.dfn_model_path: str | None = None
 
     @staticmethod
     def _resample(samples: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
@@ -158,7 +165,11 @@ class RealtimeSession:
                 input_sr=input_sr,
             )
             self.engine.initialize_stream()
-            self.runtime = await build_runtime(req, self.adapter)
+            self.runtime = await build_runtime(
+                req,
+                self.adapter,
+                dfn_model_path=self.dfn_model_path,
+            )
             self.input_queue = asyncio.Queue(maxsize=max(1, req.input_queue_size))
             self.output_slot = OutputSlot()
             self.output_event = asyncio.Event()
@@ -204,6 +215,8 @@ class RealtimeSession:
         self.adapter = None
         if self.runtime is not None and self.runtime.vad is not None:
             self.runtime.vad.reset()
+        if self.runtime is not None and self.runtime.dfn is not None:
+            self.runtime.dfn.close()
         self.runtime = None
         self.output_event = asyncio.Event()
         self.output_slot = OutputSlot()
@@ -241,12 +254,15 @@ class RealtimeSession:
         now = time.monotonic()
         chunk = InputChunk(
             sequence_id=self.input_sequence,
-            input_sr=self.engine.input_sr if self.engine is not None else 0,
-            master_samples=samples.astype(np.float32, copy=False),
-            sample_views={},
+            streams={},
             features={},
             created_at=now,
             expire_at=now + self.input_ttl_ms / 1000.0,
+        )
+        chunk.set_stream(
+            "input",
+            samples.astype(np.float32, copy=False),
+            self.engine.input_sr if self.engine is not None else 0,
         )
         self.input_sequence += 1
 
@@ -276,6 +292,7 @@ class RealtimeSession:
         wave: np.ndarray,
         infer_time_ms: float,
         vad_prob: float | None = None,
+        dfn_metrics: dict | None = None,
     ):
         now = time.monotonic()
         expire_at = now + self.output_ttl_ms / 1000.0
@@ -294,6 +311,7 @@ class RealtimeSession:
                 expire_at=expire_at,
                 infer_time_ms=infer_time_ms,
                 vad_prob=vad_prob,
+                dfn_metrics=dfn_metrics,
             )
             self.stats.produced_output_chunks += 1
             self.stats.last_output_sequence_id = sequence_id
@@ -376,6 +394,13 @@ class RealtimeSession:
                     output_wave,
                     infer_time_ms,
                     vad_prob=chunk.get_feature("vad_prob"),
+                    dfn_metrics={
+                        "enabled": chunk.get_feature("dfn_enabled", False),
+                        "input_rms": chunk.get_feature("dfn_input_rms"),
+                        "output_rms": chunk.get_feature("dfn_output_rms"),
+                        "residual_rms": chunk.get_feature("dfn_residual_rms"),
+                        "rms_ratio": chunk.get_feature("dfn_rms_ratio"),
+                    },
                 )
         except asyncio.CancelledError:
             raise
@@ -472,6 +497,8 @@ async def _send_loop(websocket: WebSocket):
             }
         if slot.vad_prob is not None:
             meta["vad_prob"] = slot.vad_prob
+        if slot.dfn_metrics is not None:
+            meta["dfn"] = slot.dfn_metrics
         await websocket.send_text(json.dumps(meta))
         await websocket.send_bytes(payload)
         last_sent_version = version
@@ -555,7 +582,9 @@ def main():
     )
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=6243)
+    parser.add_argument("--dfn-model-path", type=str, default=None)
     args = parser.parse_args()
+    session.dfn_model_path = args.dfn_model_path
     uvicorn.run(app, host=args.host, port=args.port)
 
 
