@@ -222,7 +222,7 @@ class VC:
         except:
             info = traceback.format_exc()
             logger.warning(info)
-            return info, (None, None)
+            return info, None
 
     def vc_multi(
         self,

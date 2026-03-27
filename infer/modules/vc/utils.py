@@ -1,6 +1,16 @@
 import os
 
+import torch
 from fairseq import checkpoint_utils
+
+
+def _allow_fairseq_checkpoint_globals():
+    try:
+        from fairseq.data.dictionary import Dictionary
+
+        torch.serialization.add_safe_globals([Dictionary])
+    except Exception:
+        pass
 
 
 def get_index_path_from_model(sid):
@@ -20,9 +30,11 @@ def get_index_path_from_model(sid):
 
 
 def load_hubert(config):
+    _allow_fairseq_checkpoint_globals()
     models, _, _ = checkpoint_utils.load_model_ensemble_and_task(
         ["assets/hubert/hubert_base.pt"],
         suffix="",
+        arg_overrides={"weights_only": False},
     )
     hubert_model = models[0]
     hubert_model = hubert_model.to(config.device)

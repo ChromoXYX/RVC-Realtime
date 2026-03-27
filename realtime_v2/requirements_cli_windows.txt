@@ -1,0 +1,4 @@
+httpx>=0.28.1
+numpy>=1.26
+sounddevice>=0.4.6
+websockets>=15.0.1
