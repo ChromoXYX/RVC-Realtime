@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 
 import httpx
 import numpy as np
@@ -276,7 +277,7 @@ class RVCPerformanceLogger:
         sent_display = sent_sample_count if sent_sample_count is not None else "?"
         vad_display = f" vad_prob={vad_prob:.3f}" if vad_prob is not None else ""
         print(
-            f"[{time.strftime('%H:%M:%S')}] rvc-meta seq={sequence_id} infer_ms={infer_display} e2e_ms={e2e_display} sample_count={sample_count} sent_samples={sent_display}{vad_display}",
+            f"[{datetime.now().strftime("%H:%M:%S.%f")[:-3]}] rvc-meta seq={sequence_id} infer_ms={infer_display} e2e_ms={e2e_display} sample_count={sample_count} sent_samples={sent_display}{vad_display}",
             flush=True,
         )
         return {
@@ -603,7 +604,7 @@ async def run_offline_mode(args):
                         if msg_type == "audio_chunk":
                             rvc_logger.handle_audio_meta(payload)
                         print(
-                            f"[{time.strftime('%H:%M:%S')}] recv-meta type={msg_type} seq={seq} sample_count={sample_count} infer_ms={infer_time_ms}",
+                            f"[{datetime.now().strftime("%H:%M:%S.%f")[:-3]}] recv-meta type={msg_type} seq={seq} sample_count={sample_count} infer_ms={infer_time_ms}",
                             flush=True,
                         )
                     except Exception:

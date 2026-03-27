@@ -46,6 +46,17 @@ class RealtimeRVCEngine:
         self.initialized = False
         self.block_index = 0
 
+    @staticmethod
+    def _fit_16k_block(samples_16k: np.ndarray, expected: int) -> np.ndarray:
+        if len(samples_16k) == expected:
+            return samples_16k.astype(np.float32, copy=False)
+        if len(samples_16k) < expected:
+            return np.pad(samples_16k, (0, expected - len(samples_16k))).astype(
+                np.float32,
+                copy=False,
+            )
+        return samples_16k[:expected].astype(np.float32, copy=False)
+
     def _seconds_to_aligned_samples(self, seconds: float):
         zc = self.input_sr // 100
         return int(np.round(seconds * self.input_sr / zc)) * zc
@@ -75,7 +86,7 @@ class RealtimeRVCEngine:
     def get_algorithmic_delay_samples(self):
         return self.crossfade_frame + self.sola_search_frame
 
-    def _update_buffers(self, block_wave: np.ndarray):
+    def _update_buffers(self, block_wave: np.ndarray, block_wave_16k: np.ndarray | None = None):
         if len(block_wave) != self.block_frame:
             padded = np.zeros(self.block_frame, dtype=np.float32)
             padded[: len(block_wave)] = block_wave
@@ -84,14 +95,16 @@ class RealtimeRVCEngine:
         self.input_wav[:-self.block_frame] = self.input_wav[self.block_frame :].clone()
         self.input_wav[-self.block_frame :] = torch.from_numpy(block_wave).to(self.device)
 
-        recent = self.input_wav[-self.block_frame - 2 * self.zc :].detach().cpu().numpy()
-        recent_16k = librosa.resample(recent, orig_sr=self.input_sr, target_sr=16000)[160:]
         expected = 160 * (self.block_frame // self.zc + 1)
-        if len(recent_16k) != expected:
-            if len(recent_16k) < expected:
-                recent_16k = np.pad(recent_16k, (0, expected - len(recent_16k)))
-            else:
-                recent_16k = recent_16k[:expected]
+        if block_wave_16k is None:
+            recent = self.input_wav[-self.block_frame - 2 * self.zc :].detach().cpu().numpy()
+            recent_16k = librosa.resample(recent, orig_sr=self.input_sr, target_sr=16000)[160:]
+        else:
+            recent_16k = self._fit_16k_block(block_wave_16k, self.block_frame_16k)
+            recent_16k = np.concatenate(
+                [self.input_wav_16k[-160:].detach().cpu().numpy(), recent_16k]
+            )
+            recent_16k = self._fit_16k_block(recent_16k, expected)
         self.input_wav_16k[:-self.block_frame_16k] = self.input_wav_16k[self.block_frame_16k :].clone()
         self.input_wav_16k[-expected:] = torch.from_numpy(recent_16k).to(self.device)
 
@@ -104,12 +117,15 @@ class RealtimeRVCEngine:
             padded[: infer_wav.numel()] = infer_wav
         return padded
 
-    def process_block(self, block_wave: np.ndarray):
+    def process_block(self, block_wave: np.ndarray, silence_16k: np.ndarray | None = None):
         if not self.initialized:
             self.initialize_stream()
 
         input_samples = len(block_wave)
-        self._update_buffers(block_wave.astype(np.float32))
+        self._update_buffers(
+            block_wave.astype(np.float32),
+            block_wave_16k=silence_16k,
+        )
 
         if self.device.type == "cuda":
             start = torch.cuda.Event(enable_timing=True)
