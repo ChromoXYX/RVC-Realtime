@@ -79,6 +79,7 @@ class OutputSlot:
     infer_time_ms: float = 0.0
     vad_prob: float | None = None
     dfn_metrics: dict | None = None
+    timings: dict | None = None
 
 
 @dataclass
@@ -93,6 +94,20 @@ class SessionStats:
     last_output_sequence_id: int = -1
     congested: bool = False
     congestion_since: float | None = None
+    last_input_queue_wait_ms: float = 0.0
+    last_analysis_time_ms: float = 0.0
+    last_policy_time_ms: float = 0.0
+    last_execute_time_ms: float = 0.0
+    last_publish_to_send_wait_ms: float = 0.0
+    last_send_time_ms: float = 0.0
+    last_end_to_end_server_ms: float = 0.0
+    max_input_queue_wait_ms: float = 0.0
+    max_analysis_time_ms: float = 0.0
+    max_policy_time_ms: float = 0.0
+    max_execute_time_ms: float = 0.0
+    max_publish_to_send_wait_ms: float = 0.0
+    max_send_time_ms: float = 0.0
+    max_end_to_end_server_ms: float = 0.0
 
 
 class RealtimeSession:
@@ -122,6 +137,14 @@ class RealtimeSession:
         self.reconnect_ttl_ms = 30000.0
         self.runtime: RuntimePipeline | None = None
         self.dfn_model_path: str | None = None
+
+    @staticmethod
+    def _update_timing_stat(stats: SessionStats, name: str, value: float):
+        setattr(stats, f"last_{name}", value)
+        max_name = f"max_{name}"
+        current_max = getattr(stats, max_name)
+        if value > current_max:
+            setattr(stats, max_name, value)
 
     @staticmethod
     def _resample(samples: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
@@ -259,6 +282,7 @@ class RealtimeSession:
             created_at=now,
             expire_at=now + self.input_ttl_ms / 1000.0,
         )
+        chunk.set_feature("submitted_at", now)
         chunk.set_stream(
             "input",
             samples.astype(np.float32, copy=False),
@@ -293,6 +317,7 @@ class RealtimeSession:
         infer_time_ms: float,
         vad_prob: float | None = None,
         dfn_metrics: dict | None = None,
+        timings: dict | None = None,
     ):
         now = time.monotonic()
         expire_at = now + self.output_ttl_ms / 1000.0
@@ -312,10 +337,21 @@ class RealtimeSession:
                 infer_time_ms=infer_time_ms,
                 vad_prob=vad_prob,
                 dfn_metrics=dfn_metrics,
+                timings=timings,
             )
             self.stats.produced_output_chunks += 1
             self.stats.last_output_sequence_id = sequence_id
             self.stats.last_infer_time_ms = infer_time_ms
+            if timings is not None:
+                for name in (
+                    "input_queue_wait_ms",
+                    "analysis_time_ms",
+                    "policy_time_ms",
+                    "execute_time_ms",
+                    "server_pipeline_ms",
+                ):
+                    value = float(timings.get(name, 0.0))
+                    self._update_timing_stat(self.stats, name, value)
         self.output_event.set()
 
     async def _infer_loop(self):
@@ -375,20 +411,47 @@ class RealtimeSession:
                 if self.runtime is None:
                     continue
 
+                dequeued_at = time.monotonic()
+                submitted_at = float(chunk.get_feature("submitted_at", chunk.created_at))
+                input_queue_wait_ms = max(0.0, (dequeued_at - submitted_at) * 1000.0)
+
                 analysis_context = AnalysisContext(resampler=self._resample)
+                analyzer_timings: dict[str, float] = {}
+                analysis_start = time.monotonic()
                 for analyzer in self.runtime.analyzers:
+                    analyzer_name = analyzer.__class__.__name__
+                    analyzer_start = time.monotonic()
                     await analyzer.analyze(chunk, analysis_context)
+                    analyzer_timings[analyzer_name] = (
+                        time.monotonic() - analyzer_start
+                    ) * 1000.0
+                analysis_time_ms = (time.monotonic() - analysis_start) * 1000.0
 
                 execution_context = ExecutionContext(
                     engine=self.engine,
                     resampler=self._resample,
                 )
+                policy_start = time.monotonic()
                 decision = self.runtime.policy.decide(chunk, execution_context)
+                policy_time_ms = (time.monotonic() - policy_start) * 1000.0
+                execute_start = time.monotonic()
                 output_wave, infer_time_ms = await self.runtime.executor.execute(
                     chunk,
                     decision,
                     execution_context,
                 )
+                execute_time_ms = (time.monotonic() - execute_start) * 1000.0
+                publish_requested_at = time.monotonic()
+                timings = {
+                    "submitted_at": submitted_at,
+                    "dequeued_at": dequeued_at,
+                    "input_queue_wait_ms": input_queue_wait_ms,
+                    "analysis_time_ms": analysis_time_ms,
+                    "policy_time_ms": policy_time_ms,
+                    "execute_time_ms": execute_time_ms,
+                    "server_pipeline_ms": (publish_requested_at - submitted_at) * 1000.0,
+                    "analyzers": analyzer_timings,
+                }
                 await self._publish_output(
                     chunk.sequence_id,
                     output_wave,
@@ -401,6 +464,7 @@ class RealtimeSession:
                         "residual_rms": chunk.get_feature("dfn_residual_rms"),
                         "rms_ratio": chunk.get_feature("dfn_rms_ratio"),
                     },
+                    timings=timings,
                 )
         except asyncio.CancelledError:
             raise
@@ -495,12 +559,42 @@ async def _send_loop(websocket: WebSocket):
                 "infer_time_ms": slot.infer_time_ms,
                 "version": slot.version,
             }
+            timings = dict(slot.timings or {})
         if slot.vad_prob is not None:
             meta["vad_prob"] = slot.vad_prob
         if slot.dfn_metrics is not None:
             meta["dfn"] = slot.dfn_metrics
+        send_started_at = time.monotonic()
+        if timings:
+            publish_created_at = float(timings.get("published_at", slot.created_at))
+            timings["publish_to_send_wait_ms"] = max(
+                0.0, (send_started_at - publish_created_at) * 1000.0
+            )
         await websocket.send_text(json.dumps(meta))
         await websocket.send_bytes(payload)
+        send_finished_at = time.monotonic()
+        if timings:
+            timings["send_time_ms"] = (send_finished_at - send_started_at) * 1000.0
+            submitted_at = float(timings.get("submitted_at", send_started_at))
+            timings["end_to_end_server_ms"] = (
+                send_finished_at - submitted_at
+            ) * 1000.0
+            meta["timings"] = timings
+            session._update_timing_stat(
+                session.stats,
+                "publish_to_send_wait_ms",
+                float(timings["publish_to_send_wait_ms"]),
+            )
+            session._update_timing_stat(
+                session.stats,
+                "send_time_ms",
+                float(timings["send_time_ms"]),
+            )
+            session._update_timing_stat(
+                session.stats,
+                "end_to_end_server_ms",
+                float(timings["end_to_end_server_ms"]),
+            )
         last_sent_version = version
 
 
