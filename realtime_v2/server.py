@@ -98,6 +98,7 @@ class SessionStats:
     last_analysis_time_ms: float = 0.0
     last_policy_time_ms: float = 0.0
     last_execute_time_ms: float = 0.0
+    last_server_pipeline_ms: float = 0.0
     last_publish_to_send_wait_ms: float = 0.0
     last_send_time_ms: float = 0.0
     last_end_to_end_server_ms: float = 0.0
@@ -105,6 +106,7 @@ class SessionStats:
     max_analysis_time_ms: float = 0.0
     max_policy_time_ms: float = 0.0
     max_execute_time_ms: float = 0.0
+    max_server_pipeline_ms: float = 0.0
     max_publish_to_send_wait_ms: float = 0.0
     max_send_time_ms: float = 0.0
     max_end_to_end_server_ms: float = 0.0
@@ -570,6 +572,7 @@ async def _send_loop(websocket: WebSocket):
             timings["publish_to_send_wait_ms"] = max(
                 0.0, (send_started_at - publish_created_at) * 1000.0
             )
+            meta["timings"] = timings
         await websocket.send_text(json.dumps(meta))
         await websocket.send_bytes(payload)
         send_finished_at = time.monotonic()
@@ -579,7 +582,6 @@ async def _send_loop(websocket: WebSocket):
             timings["end_to_end_server_ms"] = (
                 send_finished_at - submitted_at
             ) * 1000.0
-            meta["timings"] = timings
             session._update_timing_stat(
                 session.stats,
                 "publish_to_send_wait_ms",
