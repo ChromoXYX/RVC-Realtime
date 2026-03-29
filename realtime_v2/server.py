@@ -272,7 +272,13 @@ class RealtimeSession:
                 self.last_detach_at + self.reconnect_ttl_ms / 1000.0
             )
 
-    async def submit_input(self, samples: np.ndarray):
+    async def submit_input(
+        self,
+        samples: np.ndarray,
+        *,
+        client_sent_at: float | None = None,
+        client_sequence_id: int | None = None,
+    ):
         if self.status not in (SessionStatus.RUNNING, SessionStatus.FLUSHING):
             return False
         if self.input_queue is None:
@@ -286,6 +292,14 @@ class RealtimeSession:
             expire_at=now + self.input_ttl_ms / 1000.0,
         )
         chunk.set_feature("submitted_at", now)
+        if client_sent_at is not None:
+            chunk.set_feature("client_sent_at", float(client_sent_at))
+            chunk.set_feature(
+                "client_to_server_ingress_ms",
+                max(0.0, (now - float(client_sent_at)) * 1000.0),
+            )
+        if client_sequence_id is not None:
+            chunk.set_feature("client_sequence_id", int(client_sequence_id))
         chunk.set_stream(
             "input",
             samples.astype(np.float32, copy=False),
@@ -450,6 +464,10 @@ class RealtimeSession:
                 timings = {
                     "submitted_at": submitted_at,
                     "dequeued_at": dequeued_at,
+                    "client_sent_at": chunk.get_feature("client_sent_at"),
+                    "client_to_server_ingress_ms": chunk.get_feature(
+                        "client_to_server_ingress_ms"
+                    ),
                     "input_queue_wait_ms": input_queue_wait_ms,
                     "analysis_time_ms": analysis_time_ms,
                     "policy_time_ms": policy_time_ms,
@@ -605,6 +623,7 @@ async def _send_loop(websocket: WebSocket):
 
 
 async def _recv_loop(websocket: WebSocket):
+    pending_chunk_meta: dict | None = None
     while True:
         message = await websocket.receive()
         message_type = message.get("type")
@@ -615,7 +634,12 @@ async def _recv_loop(websocket: WebSocket):
             if text is not None:
                 data = json.loads(text)
                 msg_type = data.get("type")
-                if msg_type == "flush":
+                if msg_type == "audio_chunk_meta":
+                    pending_chunk_meta = {
+                        "client_sent_at": float(data.get("client_sent_at", 0.0)),
+                        "client_sequence_id": int(data.get("sequence_id", -1)),
+                    }
+                elif msg_type == "flush":
                     await session.request_flush()
                 elif msg_type == "stop":
                     await session.stop()
@@ -640,7 +664,13 @@ async def _recv_loop(websocket: WebSocket):
             body = message.get("bytes")
             if body is not None:
                 samples = np.frombuffer(body, dtype=np.float32).copy()
-                await session.submit_input(samples)
+                chunk_meta = pending_chunk_meta or {}
+                pending_chunk_meta = None
+                await session.submit_input(
+                    samples,
+                    client_sent_at=chunk_meta.get("client_sent_at"),
+                    client_sequence_id=chunk_meta.get("client_sequence_id"),
+                )
 
 
 @app.websocket("/realtime/ws")

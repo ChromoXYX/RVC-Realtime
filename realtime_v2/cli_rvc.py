@@ -123,6 +123,7 @@ class RuntimeStats:
     output_overflow_count: int = 0
     dropped_input_blocks_for_latency: int = 0
     dropped_output_blocks_for_latency: int = 0
+    client_audio_meta_without_payload: int = 0
 
 
 @dataclass
@@ -130,6 +131,16 @@ class RVCChunkTrace:
     sequence_id: int
     sent_at: float
     sample_count: int
+
+
+@dataclass
+class ClientOutputTrace:
+    sequence_id: int
+    meta_received_at: float
+    payload_received_at: float | None = None
+    output_queued_at: float | None = None
+    playback_started_at: float | None = None
+    sample_count: int | None = None
 
 
 @dataclass
@@ -151,6 +162,7 @@ class RVCPerformanceStats:
     vad_prob_min: float = 1.0
     vad_prob_max: float = 0.0
     last_server_timing: dict | None = None
+    last_client_output_timing: dict | None = None
 
     def record(self, infer_time_ms: float | None, e2e_ms: float | None):
         if infer_time_ms is not None:
@@ -208,6 +220,8 @@ class RVCPerformanceStats:
             }
         if isinstance(self.last_server_timing, dict) and self.last_server_timing:
             summary["last_server_timing"] = self.last_server_timing
+        if isinstance(self.last_client_output_timing, dict) and self.last_client_output_timing:
+            summary["last_client_output_timing"] = self.last_client_output_timing
         return summary
 
 
@@ -217,6 +231,10 @@ class RVCPerformanceLogger:
         self.pending_chunks: collections.OrderedDict[int, RVCChunkTrace] = (
             collections.OrderedDict()
         )
+        self.pending_output_meta: collections.OrderedDict[int, ClientOutputTrace] = (
+            collections.OrderedDict()
+        )
+        self.pending_output_payload: collections.deque[ClientOutputTrace] = collections.deque()
         self.stats = RVCPerformanceStats()
         self.slow_threshold_ms = 130.0
 
@@ -329,6 +347,7 @@ class RVCPerformanceLogger:
         slow_mark = ""
         if timings is not None:
             timing_display = (
+                f" c2s_ms={self._fmt_ms(timings.get('client_to_server_ingress_ms'))}"
                 f" queue_ms={self._fmt_ms(timings.get('input_queue_wait_ms'))}"
                 f" analysis_ms={self._fmt_ms(timings.get('analysis_time_ms'))}"
                 f" policy_ms={self._fmt_ms(timings.get('policy_time_ms'))}"
@@ -346,6 +365,13 @@ class RVCPerformanceLogger:
             f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] rvc-meta seq={sequence_id} infer_ms={infer_display} e2e_ms={e2e_display} sample_count={sample_count} sent_samples={sent_display}{vad_display}{timing_display}{dfn_display}{slow_mark}",
             flush=True,
         )
+        trace = ClientOutputTrace(
+            sequence_id=sequence_id,
+            meta_received_at=time.perf_counter(),
+            sample_count=int(sample_count) if isinstance(sample_count, (int, float)) else None,
+        )
+        self.pending_output_meta[sequence_id] = trace
+        self.pending_output_payload.append(trace)
         return {
             "sequence_id": sequence_id,
             "infer_time_ms": infer_time_ms,
@@ -354,6 +380,65 @@ class RVCPerformanceLogger:
             "dfn": dfn_payload,
             "timings": timings,
         }
+
+    def attach_output_payload(self, sample_count: int | None = None):
+        if not self.enabled:
+            return None
+        if not self.pending_output_payload:
+            return None
+        trace = self.pending_output_payload.popleft()
+        trace.payload_received_at = time.perf_counter()
+        if sample_count is not None:
+            trace.sample_count = int(sample_count)
+        return trace
+
+    def mark_output_queued(self, trace: ClientOutputTrace):
+        if not self.enabled:
+            return None
+        trace.output_queued_at = time.perf_counter()
+        return trace
+
+    def mark_playback_started(self, sequence_id: int):
+        if not self.enabled:
+            return None
+        trace = self.pending_output_meta.pop(sequence_id, None)
+        if trace is None:
+            return None
+        trace.playback_started_at = time.perf_counter()
+        client_timing = {
+            "meta_to_payload_ms": (
+                (trace.payload_received_at - trace.meta_received_at) * 1000.0
+                if trace.payload_received_at is not None
+                else None
+            ),
+            "payload_to_queue_ms": (
+                (trace.output_queued_at - trace.payload_received_at) * 1000.0
+                if trace.output_queued_at is not None and trace.payload_received_at is not None
+                else None
+            ),
+            "queue_to_play_ms": (
+                (trace.playback_started_at - trace.output_queued_at) * 1000.0
+                if trace.playback_started_at is not None and trace.output_queued_at is not None
+                else None
+            ),
+            "meta_to_play_ms": (
+                (trace.playback_started_at - trace.meta_received_at) * 1000.0
+                if trace.playback_started_at is not None
+                else None
+            ),
+            "sequence_id": trace.sequence_id,
+            "sample_count": trace.sample_count,
+        }
+        self.stats.last_client_output_timing = {
+            key: round(float(value), 3)
+            for key, value in client_timing.items()
+            if isinstance(value, (int, float))
+        }
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] client-play seq={trace.sequence_id} meta_to_payload_ms={self._fmt_ms(client_timing['meta_to_payload_ms'])} payload_to_queue_ms={self._fmt_ms(client_timing['payload_to_queue_ms'])} queue_to_play_ms={self._fmt_ms(client_timing['queue_to_play_ms'])} meta_to_play_ms={self._fmt_ms(client_timing['meta_to_play_ms'])}",
+            flush=True,
+        )
+        return client_timing
 
     def get_summary(self):
         if not self.enabled:
@@ -810,6 +895,8 @@ class DeviceAudioBridge:
         self.extra_settings = extra_settings
         self.send_sequence = 0
         self.rvc_logger = RVCPerformanceLogger(enabled=True)
+        self.output_sequence = 0
+        self.pending_play_sequence: collections.deque[int] = collections.deque()
 
     def start(self):
         if self.started:
@@ -872,6 +959,11 @@ class DeviceAudioBridge:
             play = self.output_queue.get_nowait()
         except queue.Empty:
             play = np.zeros(frames, dtype=np.float32)
+            play_sequence = None
+        else:
+            play_sequence = None
+            if self.pending_play_sequence:
+                play_sequence = self.pending_play_sequence.popleft()
 
         if play.shape[0] < frames:
             padded = np.zeros(frames, dtype=np.float32)
@@ -880,11 +972,15 @@ class DeviceAudioBridge:
         elif play.shape[0] > frames:
             try:
                 self.output_queue.put_nowait(play[frames:].copy())
+                if play_sequence is not None:
+                    self.pending_play_sequence.appendleft(play_sequence)
             except queue.Full:
                 self.stats.dropped_output_chunks += 1
             play = play[:frames]
 
         outdata[:, 0] = play
+        if play_sequence is not None:
+            self.rvc_logger.mark_playback_started(play_sequence)
 
     async def get_input_block(self, timeout: float = 0.25) -> np.ndarray | None:
         try:
@@ -892,7 +988,7 @@ class DeviceAudioBridge:
         except queue.Empty:
             return None
 
-    async def submit_output_block(self, block: np.ndarray):
+    async def submit_output_block(self, block: np.ndarray, trace: ClientOutputTrace | None = None):
         block = np.asarray(block, dtype=np.float32)
         if self.low_latency_drop_old:
             dropped_for_latency = 0
@@ -907,15 +1003,23 @@ class DeviceAudioBridge:
                 self.stats.dropped_output_chunks += dropped_for_latency
         try:
             self.output_queue.put_nowait(block)
+            if trace is not None:
+                self.rvc_logger.mark_output_queued(trace)
+                self.pending_play_sequence.append(trace.sequence_id)
             self.stats.received_chunks += 1
             self.stats.received_samples += int(block.shape[0])
         except queue.Full:
             try:
                 self.output_queue.get_nowait()
+                if self.pending_play_sequence:
+                    self.pending_play_sequence.popleft()
             except queue.Empty:
                 pass
             try:
                 self.output_queue.put_nowait(block)
+                if trace is not None:
+                    self.rvc_logger.mark_output_queued(trace)
+                    self.pending_play_sequence.append(trace.sequence_id)
                 self.stats.dropped_output_chunks += 1
                 self.stats.received_chunks += 1
                 self.stats.received_samples += int(block.shape[0])
@@ -974,7 +1078,10 @@ async def receive_outputs(
                     continue
                 continue
             chunk = np.frombuffer(message, dtype=np.float32).copy()
-            await audio_bridge.submit_output_block(chunk)
+            trace = audio_bridge.rvc_logger.attach_output_payload(int(chunk.shape[0]))
+            if trace is None:
+                audio_bridge.stats.client_audio_meta_without_payload += 1
+            await audio_bridge.submit_output_block(chunk, trace=trace)
     except ConnectionClosed:
         return
 
@@ -996,7 +1103,20 @@ async def capture_and_send(
             continue
         sequence_id = audio_bridge.send_sequence
         audio_bridge.send_sequence += 1
-        audio_bridge.rvc_logger.track_sent_chunk(sequence_id, int(block.shape[0]))
+        client_sent_at = time.perf_counter()
+        audio_bridge.rvc_logger.track_sent_chunk(
+            sequence_id, int(block.shape[0]), sent_at=client_sent_at
+        )
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "audio_chunk_meta",
+                    "sequence_id": sequence_id,
+                    "client_sent_at": client_sent_at,
+                    "sample_count": int(block.shape[0]),
+                }
+            )
+        )
         await ws.send(block.astype(np.float32, copy=False).tobytes())
         audio_bridge.stats.sent_chunks += 1
         audio_bridge.stats.sent_samples += int(block.shape[0])
