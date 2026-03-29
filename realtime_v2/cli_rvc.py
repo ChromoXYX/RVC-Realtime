@@ -150,6 +150,7 @@ class RVCPerformanceStats:
     vad_prob_last: float | None = None
     vad_prob_min: float = 1.0
     vad_prob_max: float = 0.0
+    last_server_timing: dict | None = None
 
     def record(self, infer_time_ms: float | None, e2e_ms: float | None):
         if infer_time_ms is not None:
@@ -205,6 +206,8 @@ class RVCPerformanceStats:
                 "prob_max": round(self.vad_prob_max, 4),
                 "prob_last": round(self.vad_prob_last, 4) if self.vad_prob_last is not None else None,
             }
+        if isinstance(self.last_server_timing, dict) and self.last_server_timing:
+            summary["last_server_timing"] = self.last_server_timing
         return summary
 
 
@@ -215,6 +218,13 @@ class RVCPerformanceLogger:
             collections.OrderedDict()
         )
         self.stats = RVCPerformanceStats()
+        self.slow_threshold_ms = 130.0
+
+    @staticmethod
+    def _fmt_ms(value) -> str:
+        if not isinstance(value, (int, float)):
+            return "?"
+        return f"{float(value):.2f}"
 
     def track_sent_chunk(
         self, sequence_id: int, sample_count: int, sent_at: float | None = None
@@ -271,6 +281,24 @@ class RVCPerformanceLogger:
             is_silence = (infer_time_ms is not None and infer_time_ms == 0.0)
             self.stats.record_vad(vad_prob, is_silence)
 
+        timings_payload = payload.get("timings")
+        timings: dict | None = timings_payload if isinstance(timings_payload, dict) else None
+        if timings is not None:
+            analyzer_timings = timings.get("analyzers")
+            analyzer_display = ""
+            if isinstance(analyzer_timings, dict) and analyzer_timings:
+                analyzer_display = " analyzers=" + ",".join(
+                    f"{name}:{self._fmt_ms(value)}ms"
+                    for name, value in analyzer_timings.items()
+                )
+            self.stats.last_server_timing = {
+                key: round(float(value), 3)
+                for key, value in timings.items()
+                if key != "analyzers" and isinstance(value, (int, float))
+            }
+        else:
+            analyzer_display = ""
+
         dfn_payload = payload.get("dfn")
         dfn_display = ""
         if isinstance(dfn_payload, dict) and dfn_payload.get("enabled"):
@@ -297,8 +325,25 @@ class RVCPerformanceLogger:
         e2e_display = f"{e2e_ms:.2f}" if e2e_ms is not None else "?"
         sent_display = sent_sample_count if sent_sample_count is not None else "?"
         vad_display = f" vad_prob={vad_prob:.3f}" if vad_prob is not None else ""
+        timing_display = ""
+        slow_mark = ""
+        if timings is not None:
+            timing_display = (
+                f" queue_ms={self._fmt_ms(timings.get('input_queue_wait_ms'))}"
+                f" analysis_ms={self._fmt_ms(timings.get('analysis_time_ms'))}"
+                f" policy_ms={self._fmt_ms(timings.get('policy_time_ms'))}"
+                f" execute_ms={self._fmt_ms(timings.get('execute_time_ms'))}"
+                f" pipeline_ms={self._fmt_ms(timings.get('server_pipeline_ms'))}"
+                f" pubwait_ms={self._fmt_ms(timings.get('publish_to_send_wait_ms'))}"
+                f" send_ms={self._fmt_ms(timings.get('send_time_ms'))}"
+                f" server_e2e_ms={self._fmt_ms(timings.get('end_to_end_server_ms'))}"
+                f"{analyzer_display}"
+            )
+            end_to_end_server_ms = timings.get("end_to_end_server_ms")
+            if isinstance(end_to_end_server_ms, (int, float)) and float(end_to_end_server_ms) >= self.slow_threshold_ms:
+                slow_mark = " SLOW_BLOCK"
         print(
-            f"[{datetime.now().strftime("%H:%M:%S.%f")[:-3]}] rvc-meta seq={sequence_id} infer_ms={infer_display} e2e_ms={e2e_display} sample_count={sample_count} sent_samples={sent_display}{vad_display}{dfn_display}",
+            f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] rvc-meta seq={sequence_id} infer_ms={infer_display} e2e_ms={e2e_display} sample_count={sample_count} sent_samples={sent_display}{vad_display}{timing_display}{dfn_display}{slow_mark}",
             flush=True,
         )
         return {
@@ -307,6 +352,7 @@ class RVCPerformanceLogger:
             "e2e_ms": e2e_ms,
             "vad_prob": vad_prob,
             "dfn": dfn_payload,
+            "timings": timings,
         }
 
     def get_summary(self):

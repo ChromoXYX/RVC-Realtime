@@ -80,6 +80,7 @@ class OutputSlot:
     vad_prob: float | None = None
     dfn_metrics: dict | None = None
     timings: dict | None = None
+    sent_meta_version: int = 0
 
 
 @dataclass
@@ -324,6 +325,8 @@ class RealtimeSession:
         now = time.monotonic()
         expire_at = now + self.output_ttl_ms / 1000.0
         payload = wave.astype(np.float32, copy=False).tobytes()
+        slot_timings = dict(timings or {})
+        slot_timings["published_at"] = now
         async with self.slot_lock:
             old = self.output_slot
             if old.version > 0 and old.expire_at > now:
@@ -339,12 +342,12 @@ class RealtimeSession:
                 infer_time_ms=infer_time_ms,
                 vad_prob=vad_prob,
                 dfn_metrics=dfn_metrics,
-                timings=timings,
+                timings=slot_timings,
             )
             self.stats.produced_output_chunks += 1
             self.stats.last_output_sequence_id = sequence_id
             self.stats.last_infer_time_ms = infer_time_ms
-            if timings is not None:
+            if slot_timings:
                 for name in (
                     "input_queue_wait_ms",
                     "analysis_time_ms",
@@ -352,7 +355,7 @@ class RealtimeSession:
                     "execute_time_ms",
                     "server_pipeline_ms",
                 ):
-                    value = float(timings.get(name, 0.0))
+                    value = float(slot_timings.get(name, 0.0))
                     self._update_timing_stat(self.stats, name, value)
         self.output_event.set()
 
@@ -552,8 +555,15 @@ async def _send_loop(websocket: WebSocket):
                 session.stats.expired_output_chunks += 1
                 session.output_slot = OutputSlot()
                 continue
+            send_started_at = time.monotonic()
             version = slot.version
             payload = slot.payload
+            timings = dict(slot.timings or {})
+            if timings:
+                publish_created_at = float(timings.get("published_at", slot.created_at))
+                timings["publish_to_send_wait_ms"] = max(
+                    0.0, (send_started_at - publish_created_at) * 1000.0
+                )
             meta = {
                 "type": "audio_chunk",
                 "sequence_id": slot.sequence_id,
@@ -561,18 +571,12 @@ async def _send_loop(websocket: WebSocket):
                 "infer_time_ms": slot.infer_time_ms,
                 "version": slot.version,
             }
-            timings = dict(slot.timings or {})
-        if slot.vad_prob is not None:
-            meta["vad_prob"] = slot.vad_prob
-        if slot.dfn_metrics is not None:
-            meta["dfn"] = slot.dfn_metrics
-        send_started_at = time.monotonic()
-        if timings:
-            publish_created_at = float(timings.get("published_at", slot.created_at))
-            timings["publish_to_send_wait_ms"] = max(
-                0.0, (send_started_at - publish_created_at) * 1000.0
-            )
-            meta["timings"] = timings
+            if slot.vad_prob is not None:
+                meta["vad_prob"] = slot.vad_prob
+            if slot.dfn_metrics is not None:
+                meta["dfn"] = slot.dfn_metrics
+            if timings:
+                meta["timings"] = timings
         await websocket.send_text(json.dumps(meta))
         await websocket.send_bytes(payload)
         send_finished_at = time.monotonic()
